@@ -6,7 +6,6 @@ import json
 import time
 import sys
 import numpy as np
-# import torch
 import argparse
 
 from transformers import AutoTokenizer
@@ -23,37 +22,21 @@ num_char = 200
 
 
 rejection_sampling = 0
-ICRL = 0
-exploration_only = 0
-exploitation_only = 0
-no_reward_exploration = 0
-exploration_or_exploitation = 0
-no_reward = 0
-zero_reward = 0
-exploration_and_exploitation = 1
+
+
+
+
+
 
 load_samples = 0
 
-num_weak_demo = 300000
+num_weak_demo = 3000
 
 
 api_eval = True
 
 
 client = OpenAI(api_key="Your_API_Key")
-
-
-
-
-no_reward_exploration_instruction = "Instruction: Examine all the `<attempt>…</attempt>` examples, each showing a candidate Response. Provide a response that is different from every single one of the previous attempts demonstrated in the context, while making sure it correctly follows the task instruction, and put it in `<answer>**Response** Step1: ... Step2: ... Step3: ... **Answer**: <math operations of the 4 input numbers = 24></answer>` format."
-
-# simple instruction
-exploitation_instruction = "Instruction: You will be given multiple <attempt>…</attempt> examples, each showing a candidate Response, and the Rewards for each step of the Response. Your task: Based on the previous attempts, try your best to produce a response that can achieve higher rewards, and put it in `<answer>**Response** Step1: ... Step2: ... Step3: ... **Answer**: <math operations of the 4 input numbers = 24></answer>` format."
-
-exploration_instruction = "Instruction: Examine all the `<attempt>…</attempt>` examples, each showing a candidate Response, the Reward for each step of the Response, and a total Return of the steps.  Provide a response that is completely different for any steps from every single one of the previous attempts demonstrated in the context, while making sure it correctly follows the task instruction. Make sure the response correctly follows the task instruction, and put it in `<answer>**Response** Step1: ... Step2: ... Step3: ... **Answer**: <math operations of the 4 input numbers = 24></answer>` format."
-
-explore_or_exploit_instruction = "Instruction: Examine all the `<attempt>…</attempt>` examples, each showing a candidate Response and its Reward. You have two options, exploration or exploitation. For exploration, provide a response that is completely different for any steps from every single one of the previous attempts demonstrated in the context, while making sure it correctly follows the task instruction. Make sure the response correctly follows the task instruction, and put it in `<answer>**Response** Step1: ... Step2: ... Step3: ... **Answer**: <math operations of the 4 input numbers = 24></answer>` format.\n For exploitation, based on the previous attempts, try your best to produce a response that can achieve higher rewards, and put it in `<answer>**Response** Step1: ... Step2: ... Step3: ... **Answer**: <math operations of the 4 input numbers = 24></answer>` format, while making sure it correctly follows the task instruction, and put it in `<answer>…</answer>` format. Pick one option to follow."
-
 
 text = ""
 
@@ -62,7 +45,7 @@ text = ""
 # import os
 
 # Add the directory to Python's path
-sys.path.append('/tree-of-thought-llm/src')
+sys.path.append('tree-of-thought-llm/src')
 
 from sympy import sympify
 from tot.tasks import get_task
@@ -97,11 +80,12 @@ def evaluate_checkpoint(
     # Load tokenizer.
     tokenizer = AutoTokenizer.from_pretrained(base_model_id)
     
-
+   
     
     sampling_params = SamplingParams(temperature=0.6, top_p=0.95, max_tokens=max_new_tokens)
     
-
+    # Prepare a list for all samples that meet the criteria.
+    # Each entry stores the question, a history of weak demos, and outputs per round.
     samples = []
 
     for idx in range(num_samples):
@@ -117,17 +101,9 @@ def evaluate_checkpoint(
     
     
     if load_samples:
-        with open("intermediate_round_game24_llm_optimizers.pkl", "rb") as f:
+        with open("intermediate_round_game24_self-refine.pkl", "rb") as f:
             samples = pickle.load(f)
-        
     
-    task_prompt = "You are a comedy writer competing for the highest laughs. Your goal is to write a short passage that would score a perfect 10 on the humor scale of a seasoned comedy critic. A score of 10 means the critic laughed out loud and found the content wildly entertaining, creative, and clever. You are allowed numerous attempts, each attempt are followed by a reward for your response, and will be placed in the context. Learn from these experience of attempts and provide a response that can achieve a higher reward from this comedy critic. \n"
-    
-    task_prompt = "Write a short humorous passage for the following prompt that matches with the following reward."
-    task_prompt0 = "Write a short humorous passage for the following prompt."
-    task_prompt = "Write a short passage for the following prompt that is as humorous as possible."
-    
-    task_prompt_cot = "Use numbers and basic arithmetic operations (+ - * /) to obtain 24. Each step, you are only allowed to choose two of the remaining numbers to obtain a new number."
 
     task_prompt = "Use all 4 numbers provided in the Input without repetition and basic arithmetic operations (+ - * /) to obtain 24. Only three steps are required and allowed."  
     # For the first step, you can only use numbers from the input. For the second and third steps, you can use the numbers from what is left after the previous step."
@@ -138,88 +114,29 @@ def evaluate_checkpoint(
         # Build a prompt for each sample.
         batch_prompts = []
         for sample in samples:
-
-            
             prompt = one_shot_prompt
-
-            if round_idx == -1:
-
-                prompt += "<attempt>\n"
-
-                prompt += f"**Prompt**: Input: {sample['question']}\n"
-                if not no_reward:
-                    prompt += f"**Reward**: 0.00\n"
+            if len(sample["weak_demos"]) > 0:
+                for weak_demo in sample["weak_demos"][-num_weak_demo:]:
+                    prompt += "<attempt>\n"
+                    # prompt += f"**Task**: {task_prompt_cot}"
+                    prompt += f"Input: {weak_demo['prompt']}\n"
+                    prompt += weak_demo['answer'][:] + "\n"
+                    prompt += f"Feedback: {weak_demo['feedback']}\n"
                 
+                
+                prompt += "**Task**: " + task_prompt
+                prompt += f"Input: {sample['weak_demos'][-1]['prompt']}"
+                prompt += sample["weak_demos"][-1]['answer']
+
+                prompt += "First, provide feedback for the solution: There is an error in the solution above because of lack of understanding of the question. What is the error? To find the error, go through semantically complete steps of the solution, and check if everything looks good."
             else:
-                if not rejection_sampling: 
-                    # Add previous weak demonstrations if any.
-                    for weak_demo in sample["weak_demos"][-num_weak_demo:]:
-                        prompt += "<attempt>\n"
-
-                        prompt += f"**Prompt**: Input: {weak_demo['prompt']}\n"
-
-                        
-                        ### steps reward here
-                        
-                        if not no_reward:
-                        
-                            try:
-                                prompt +="**Response** Step" + weak_demo['answer'].split("Step")[1] 
-                                prompt += f"<Reward: {weak_demo['gpt_eval_reward_list'][0]}> Step" + weak_demo['answer'].split("Step")[2] 
-                                prompt += f"<Reward: {weak_demo['gpt_eval_reward_list'][1]}> Step" + weak_demo['answer'].split("Step")[3].split("**Answer**")[0] 
-                                prompt += f"<Reward: {weak_demo['gpt_eval_reward_list'][2]}> **Answer**" + weak_demo['answer'].split("**Answer**")[1]
-                            except:
-                                prompt += "" + weak_demo['answer'][:] + "\n"
-                        else:
-                            prompt += "" + weak_demo['answer'][:] + "\n"
-                        # prompt += f"**Format Reward**: {weak_demo['format_reward']}\n"
-                        
-                        if not no_reward: 
-                            if zero_reward: 
-                                prompt += f"**Reward**: {0.00}\n"
-                            else:
-                                # prompt += f"**Reward**: {weak_demo['gpt_eval_reward']}\n"
-                                
-                                # prompt += f"""**Reward**: Step 1 Reward: {weak_demo['gpt_eval_reward_list'][0]}, \n
-                                # Step 2 Reward: {weak_demo['gpt_eval_reward_list'][1]}, \n
-                                # Step 3 Reward: {weak_demo['gpt_eval_reward_list'][2]}, \n
-                                # Final Answer Reward: {weak_demo['gpt_eval_reward_list'][3]}. \n
-                                # \n"""
-                                # prompt += f"""**Return**: {weak_demo['gpt_eval_return']}. \n"""
-                                prompt += f"""**Reward**: {weak_demo['gpt_eval_return']}. \n"""
-                            
-                        prompt += "</attempt>"
-                    
-                    prompt += "<instructions>\n"
-                    # may need to adjust the one_shot_prompt demonstrations once we start explore and exploit.
-                    
-                    if ICRL: 
-                        if round_idx % 2 == 1:
-                            prompt += exploitation_instruction
-                        else:
-                            prompt += exploration_instruction  
-                        # if round_idx % 2 == 0:
-                        #     prompt += exploration_instruction
-                        # else:
-                        #     prompt += exploitation_instruction
-                    if exploration_only:
-                        prompt += exploration_instruction
-                    if exploitation_only:
-                        prompt += exploitation_instruction
-                    if no_reward_exploration: 
-                        prompt += no_reward_exploration_instruction
-                    if exploration_or_exploitation: 
-                        prompt += explore_or_exploit_instruction
-                    if exploration_and_exploitation:
-                        prompt += explore_and_exploit_instruction
+                prompt += "**Task**: " + task_prompt
+                prompt += f"Input: {sample['question']}"
+            prompt += "Put your feedback within `<feedback>...</feedback>` tags."
+            prompt += " Then, only make one attempt based on the feedback, and put your answer in `<answer>**Response** Step1: ... (left: ...) Step2: ... (left: ...) Step3: ... (left: ...) **Answer**: <math operations of the 4 input numbers, even if it does not equal 24></answer>` format. Whether the Answer is correct or incorrect, do not try again. \n"
 
 
-                prompt += " Only make one attempt, and put your answer in `<answer>**Response** Step1: ... (left: ...) Step2: ... (left: ...) Step3: ... (left: ...) **Answer**: <math operations of the 4 input numbers, even if it does not equal 24></answer>` format. Whether the Answer is correct or incorrect, do not try again. \n"
-
-                prompt += "\n</instructions>\n"
-                prompt += "<attempt>\n"
-
-                prompt += f"**Prompt**: Input: {sample['question']}\n"
+            prompt += f"**Prompt**: Input: {sample['question']}\n"
 
             batch_prompts.append(prompt)
         
@@ -227,7 +144,7 @@ def evaluate_checkpoint(
         model_name = "gpt-4.1"
 
             
-        with ThreadPoolExecutor(max_workers=12) as pool:
+        with ThreadPoolExecutor(max_workers=20) as pool:
             api_outputs = list(pool.map(
                 lambda p: client.responses.create(model=model_name, input=p).output_text,
                 batch_prompts
@@ -236,6 +153,7 @@ def evaluate_checkpoint(
         eval_prompt_list = []
         eval_prompt_full_answer_list = []
         
+        # if round_idx != 0:
         
         for i, output_obj in enumerate(api_outputs):
             # Retrieve generated text.
@@ -244,26 +162,31 @@ def evaluate_checkpoint(
 
             pattern = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
 
+            # first or last, could be an important difference
+
+
             try:
                 generated_text = pattern.findall(generated_text)[0]
 
             except:
                 generated_text = ""
 
+
             m = re.search(r'^(?:.*\*\*Answer\*\*):\s*(.*)$', generated_text, re.DOTALL)
+
             if m:
                 model_answer = m.groups()[-1].strip()
             else:
                 model_answer = ""
 
 
-            print("model_answer", model_answer)
+
 
 
             if "\\\\(" in model_answer:
                 print("found \\\\("*20)
                 model_answer = model_answer.replace("\\\\(", "")
-        
+            
                 
             eval_prompt_full_answer_list.append(generated_text)
             eval_prompt_list.append(model_answer)
@@ -274,7 +197,6 @@ def evaluate_checkpoint(
         gpt_eval_prompt_list = []
 
         for index, model_answer in enumerate(eval_prompt_list):
-            
         
             
             
@@ -310,7 +232,8 @@ def evaluate_checkpoint(
             except: 
                 answer_step = ""
                 
-
+            # and think about how likely they are to reach 24
+            # If the step is invalid, such as using numbers outside of the 4 input numbers or wrong calculations, the score is 0.
             
             eval_prompt_1 = f"""Rule of Game of 24: use all 4 numbers provided in the Input without repetition and basic arithmetic operations (+ - * /) to obtain 24. Only three steps are required and allowed.
             Given the following four numbers, {samples[index]['question']}, the first step to game of 24 is {first_step}. Evaluate this step:
@@ -347,9 +270,7 @@ def evaluate_checkpoint(
             
             gpt_eval_prompt_list.append(eval_prompt)
 
-            print()
-            print("eval_prompt", eval_prompt)
-            print()
+
             try:
                 lhs = sympify(model_answer.split("=")[0])
                 expr = sympify(model_answer.split("=")[0], evaluate=False)
@@ -369,9 +290,7 @@ def evaluate_checkpoint(
                 operand.sort()
                 true_operand.sort()
 
-                print("model_answer", model_answer)
-                print("operand", operand)
-                print("true_operand", true_operand)
+
 
                 format_reward = 0
 
@@ -384,20 +303,23 @@ def evaluate_checkpoint(
                             break
                 print("format_reward", format_reward)
                 format_reward_list.append(format_reward)
+                # expr = sympify(model_answer.split("=")[0], evaluate=False)
+
                 eval_result_list.append(lhs)
             except Exception as e:
                 # Print the error details
                 print(f"Error with input '{model_answer}': {type(e).__name__}: {e}")
+                # Optionally print full traceback:
                 import traceback
                 traceback.print_exc()
                 # Still append a default value
                 eval_result_list.append(0)
                 format_reward_list.append(-30.0)
 
+
+        eval_model_name = "gpt-4.1-nano"
         
-        eval_model_name = "gpt-4.1-mini"
-        eval_model_name = "gpt-4.1"
-        
+
 
         flat_prompts = list(chain.from_iterable(gpt_eval_prompt_list))
 
@@ -416,33 +338,43 @@ def evaluate_checkpoint(
         ]
 
         # Process batch responses.
-        for i, output_obj in enumerate(eval_api_outputs):
+        for i, output_obj in enumerate(api_outputs):
             # Retrieve generated text.
             generated_text = output_obj
 
             pattern = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
 
-            # first or last, could be an important difference
 
             try:
                 generated_text = pattern.findall(generated_text)[0]
+                # generated_text = generated_text[8:-9]
+                # generated_text = generated_text.split("<answer>")[1]
             except:
                 generated_text = ""
 
+            
             m = re.search(r'^(?:.*\*\*Answer\*\*):\s*(.*)$', generated_text, re.DOTALL)
             if m:
                 model_answer = m.groups()[-1].strip()
             else:
                 model_answer = ""
+                
+                
+            pattern = re.compile(r'<feedback>(.*?)</feedback>', re.DOTALL)
+            
+            print("output_obj", output_obj)
+            
+            
+            try:
+                model_feedback = pattern.findall(output_obj)[0]
 
+            except:
+                model_feedback = ""
             
-
+            print("model_feedback", model_feedback)
             
-        
-            print('+='*20)
-            print('eval_result_list[i]:', eval_result_list[i])
-            
-            
+                
+           
             try:
                 accuracy_reward_value = float(-np.abs(eval_result_list[i] - 24))
             except:
@@ -472,9 +404,9 @@ def evaluate_checkpoint(
                 if m:
                     gpt_eval_reward = m.group(1)
                     gpt_eval_reward = float(gpt_eval_reward)
-                    print("gpt_eval_reward", gpt_eval_reward)  # -> '1'
+
                 else:
-                    print("No match")
+
                     gpt_eval_reward = 0
 
                 gpt_eval_reward_str = f"{gpt_eval_reward:.2f}"
@@ -482,6 +414,9 @@ def evaluate_checkpoint(
                 
                 gpt_eval_reward_list.append(gpt_eval_reward)
                 gpt_eval_reward_str_list.append(gpt_eval_reward_str)
+                
+                
+
                 
                 
             gpt_eval_return = np.sum(gpt_eval_reward_list)
@@ -492,6 +427,7 @@ def evaluate_checkpoint(
             weak_demo = {
                 "prompt": samples[i]["question"],
                 "answer": eval_prompt_full_answer_list[i],
+                "feedback":model_feedback,
                 "accuracy_reward": accuracy_reward_str,
                 "format_reward": format_reward_str,
                 "gpt_eval_reward_list": gpt_eval_reward_str_list,
@@ -504,7 +440,8 @@ def evaluate_checkpoint(
                 "round": round_idx,
                 "prompt": batch_prompts[i],
                 "answer": model_answer,
-                "generated_text": generated_text,
+                "feedback":model_feedback,
+                "generated_text": api_outputs[i],
                 "accuracy_reward": accuracy_reward_str,
                 "format_reward": format_reward_str,
                 "model_answer": eval_prompt_full_answer_list[i],
@@ -513,8 +450,60 @@ def evaluate_checkpoint(
                 "gpt_eval_return": gpt_eval_return_str,
                 "gpt_eval_response": eval_responses
             })
+            
+        ## Generating Reflexion    
+        batch_prompts = []
+        for sample in samples:
+
+            last_weak_demo = sample["weak_demos"][-1]
+            prompt = ""
+            prompt += "<attempt>\n"
+            ### dense reward
+            prompt += f"**Prompt**: Input: {last_weak_demo['prompt']}\n"
+
+            try:
+                prompt +="**Response** Step" + last_weak_demo['answer'].split("Step")[1] 
+                prompt += f"<Reward: {last_weak_demo['gpt_eval_reward_list'][0]}> Step" + last_weak_demo['answer'].split("Step")[2] 
+                prompt += f"<Reward: {last_weak_demo['gpt_eval_reward_list'][1]}> Step" + last_weak_demo['answer'].split("Step")[3].split("**Answer**")[0] 
+                prompt += f"<Reward: {last_weak_demo['gpt_eval_reward_list'][2]}> **Answer**" + last_weak_demo['answer'].split("**Answer**")[1]
+            except:
+                prompt += "" + last_weak_demo['answer'][:] + "\n"
+
+
+            prompt += f"""**Reward**: {last_weak_demo['gpt_eval_return']}. \n"""
+            
+            prompt += "<attempt>\n"
+            
+            # here, instead of asking a question, ask for a reflexion
+            
+            prompt += "Instruction: You will be given the history of a past experience in which you encountered a task of game of 24 that required you to provide a correct response to the input numbers aiming to maximize the rewards, and you attempted a response. You were unsuccessful in providing an answer that is correct. Instead of recounting the details of the task itself, focus on analyzing the approach you took and the specific actions or steps you attempted. Based on this reflection, devise a concise, revised plan of action that acknowledges your error and details the exact measures or methods you should have employed. For example, if you attempted steps A and B but overlooked step C, construct a plan that explicitly incorporates step C into your approach. This self-reflection and plan will be essential for when you reattempt the task. Present your plan immediately following the keyword “Plan:”.\n"
+            prompt += "Plan:"
+            
+
+            batch_prompts.append(prompt)
+                    
+
+        with ThreadPoolExecutor(max_workers=20) as pool:
+            api_outputs = list(pool.map(
+                lambda p: client.responses.create(model=model_name, input=p).output_text,
+                batch_prompts
+            ))
         
-        with open("intermediate_round_game24_llm_optimizers.pkl", "wb") as f:
+        for i, output_obj in enumerate(api_outputs):
+            # Retrieve generated text.
+            generated_text = output_obj
+            
+            reflexion = generated_text
+            
+            sample = samples[i]
+            
+            
+            last_weak_demo = sample["weak_demos"][-1]
+            
+            last_weak_demo['plan'] = reflexion
+        
+
+        with open("intermediate_round_game24_self-refine.pkl", "wb") as f:
             pickle.dump(samples, f)
             
         if round_idx % 1 == 0:
@@ -544,7 +533,7 @@ def evaluate_checkpoint(
             if rejection_sampling:
                 this_time_change += "rejection_100"
             else:
-                this_time_change += "4.1_eval_llm_as_optimizer_reward_only_ICRL"
+                this_time_change += "4.1_eval_100_correct_self-refine_ICRL"
                 
             this_time_change += "_4.1"
             
@@ -579,6 +568,5 @@ def evaluate_checkpoint(
 if __name__ == "__main__":
     print("Evaluating checkpoint in batch mode...")
     evaluate_checkpoint()
-    # main()
 
 
