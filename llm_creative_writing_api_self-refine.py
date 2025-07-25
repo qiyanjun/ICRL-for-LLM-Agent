@@ -15,6 +15,7 @@ from vllm import LLM, SamplingParams
 
 from concurrent.futures import ThreadPoolExecutor
 
+
 from openai import OpenAI
 
 num_char = 200
@@ -25,20 +26,15 @@ api_eval = True
 
 rejection_sampling = 0
 
+load_samples = 1
 
-exploration_or_exploitation = 0
 num_weak_demos = 3000
-
-
-
-sort_by_reward = 0
+num_weak_demo = 3000
 
 
 
 client = OpenAI(api_key="Your_API_Key")
 
-
-sys.path.append('/tree-of-thought-llm/src')
 
 
 from tot.tasks import get_task
@@ -65,12 +61,16 @@ def evaluate_checkpoint(
     tokenizer = AutoTokenizer.from_pretrained(base_model_id)
     
     sampling_params = SamplingParams(temperature=0.6, top_p=0.95, max_tokens=max_new_tokens)
-
+    
+    # Prepare a list for all samples that meet the criteria.
+    # Each entry stores the question, a history of weak demos, and outputs per round.
     
     task = get_task("text")
     
     samples = []
     for idx in range(num_samples):
+        # question = sample.get('instruction', "")
+        # question_input = sample.get('input', "")
         instruction = task.get_input(idx)
         
         cot_prompt_filled = cot_prompt.format(input=instruction)
@@ -79,6 +79,8 @@ def evaluate_checkpoint(
         # scoring code looks for.  Appending it here nudges the model to continue
         # with the actual passage.
         question = cot_prompt_filled
+        # if len(question_input) != 0:
+        #     continue
         samples.append({
             "question": question,
             "weak_demos": [],  # will hold dictionaries with keys: prompt, answer, reward
@@ -88,22 +90,38 @@ def evaluate_checkpoint(
     num_samples = len(samples)
     print(f"Processing {num_samples} samples in {n} rounds...")
     
+    if load_samples:
+        with open("intermediate_round_creative_writing_self_refine.pkl", "rb") as f:
+            samples = pickle.load(f)
+
+    
     # Run n rounds.
     for round_idx in range(n):
         print(f"Round {round_idx+1}/{n}...")
         # Build a prompt for each sample.
         batch_prompts = []
         for sample in samples:
-            
-            
             prompt = ""
+            if len(sample["weak_demos"]) > 0:
+                for weak_demo in sample["weak_demos"][-num_weak_demo:]:
+                    prompt += "<attempt>\n"
+                    prompt += f"**Prompt**: {weak_demo['prompt']}\n"
+                    prompt += weak_demo['answer'][:] + "\n"
+                    prompt += f"**Feedback**: {weak_demo['feedback']}\n"
+                
+                
+                
+                prompt += f"**Prompt**: {sample['weak_demos'][-1]['prompt']}"
+                prompt += sample["weak_demos"][-1]['answer']
 
-            for weak_demo in sample["weak_demos"][-num_weak_demos:]:
-                prompt += f"**Plan**: {weak_demo['plan']}\n"
-                
-            prompt += "Provide the response in `<answer>…</answer>` format."
-                
-            prompt += f"**Prompt**: {sample['question']}\n"
+                prompt += "**Instruction**: First, provide feedback for the writing to improve its coherence. Provide a score n out of 5, and identify places that can be modified to improve coherence."
+                prompt += "Put your feedback within `<feedback>...</feedback>` tags."
+                prompt += " Then, provide a new response based on the feedback, and then provide your Plan and Passage in `<answer>Plan:...Passage:...</answer>` format."
+            else:
+                prompt += "provide your Plan and Passage in `<answer>Plan:...Passage:...</answer>` format."
+                prompt += f"**Prompt**: {sample['question']}"
+
+
             batch_prompts.append(prompt)
         
         model_name = "gpt-4.1"
@@ -121,6 +139,7 @@ def evaluate_checkpoint(
             for i, output_obj in enumerate(api_outputs):
                 # Retrieve generated text.
                 generated_text = output_obj
+
                     
                 pattern = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
                 try:
@@ -144,6 +163,7 @@ def evaluate_checkpoint(
                 
                 base_answer = samples[i]['weak_demos'][0]['answer']
                 
+                
                 try:
                     base_answer = base_answer.split("Passage:")[1]
                 except:
@@ -153,7 +173,7 @@ def evaluate_checkpoint(
                 base_answer = """At dawn, golden light slips past pale curtains, rousing the world in quiet celebration. A lone robin greets the morning with a clear, cheerful trill, its song drifting across dew-laden grass. A gentle breeze stirs the leaves, carrying the fresh, earthy scent of new growth. Nearby, rooftops and empty streets lie poised between night’s calm and the city’s stirring pulse, promising simple comforts like a warm cup of coffee. In this tranquil pause, one senses life’s renewal and the gentle invitation to greet the day with hope and gratitude."""
                 
                 eval_prompt = f"Instruction: You are a seasoned text coherence evaluator. Read the TEXT below and rate the TEXT’s overall coherency on a 1-to-10 scale, where 1 means less coherent than the Base Answer, 5 means as coherent as the Base Answer, and 10 means way more coherent than the Base Answer. Be a strict and conservative evaluator and only gave a high score when the TEXT is truly better than the Base Answer. Base Answer: <<<{base_answer}>>> TEXT:<<<{model_answer}>>> Return your answer in exactly this format: Coherency score: <integer 1-10>. \nResponse:"
-
+                
                 eval_prompt_list.append(eval_prompt)
 
 
@@ -162,9 +182,6 @@ def evaluate_checkpoint(
            
             
             if api_eval:
-            
-                # model_name = "gpt-4o-mini"
-                # model_name = "gpt-4.1-mini"
                 model_name = "gpt-4.1"
                 with ThreadPoolExecutor(max_workers=12) as pool:
                     eval_result_list = list(pool.map(
@@ -183,6 +200,8 @@ def evaluate_checkpoint(
             m = _RATING_RE.search(text)
             return int(m.group(1)) if m else None
 
+
+
         # Process batch responses.
         for i, output_obj in enumerate(api_outputs):
             # Retrieve generated text.
@@ -194,11 +213,23 @@ def evaluate_checkpoint(
             except:
                 model_answer = ""
                 
+            pattern = re.compile(r'<feedback>(.*?)</feedback>', re.DOTALL)
+            
+            print("output_obj", output_obj)
+            
+            
+            try:
+                model_feedback = pattern.findall(output_obj)[0]
+            except:
+                model_feedback = ""
+                
+                
                 
             if rejection_sampling:
                 model_answer = generated_text
                 
-
+                
+        
             if round_idx != 0:
 
                 eval_result = eval_result_list[i]
@@ -233,6 +264,9 @@ def evaluate_checkpoint(
                 reward_value = 1.00
 
 
+
+
+
             if round_idx == 0:
                 eval_result = ""
                 eval_prompt_i = ""
@@ -242,6 +276,7 @@ def evaluate_checkpoint(
             weak_demo = {
                 "prompt": samples[i]["question"],
                 "answer": model_answer,
+                "feedback": model_feedback,
                 "reward": reward_str
             }
             # Append to the sample's weak demo history.
@@ -260,25 +295,29 @@ def evaluate_checkpoint(
         ## Generating Reflexion    
         batch_prompts = []
         for sample in samples:
+
             last_weak_demo = sample["weak_demos"][-1]
             prompt = ""
             prompt += "<attempt>\n"
             prompt += f"**Question**: {last_weak_demo['prompt']}\n"
-            # 4399: at first, we don't have weak demo at all. 
-            # prompt += f"**Plan**: {weak_demo['reflexion']}\n"
+
             prompt += f"**Reward**: {last_weak_demo['reward']}\n"
             prompt += last_weak_demo['answer'] + "\n"
-            # Append the new attempt with the current question.
             prompt += "<attempt>\n"
             
-            # here, instead of asking a question, ask for a reflexion
             
             prompt += "Instruction: You will be given the history of a past experience in which you encountered a task that required you to provide a response to a prompt aiming to maximize a reward, and you attempted a response. You were unsuccessful in providing an answer that achieved the specified desirable numerical reward of 10.0. Instead of recounting the details of the task itself, focus on analyzing the approach you took and the specific actions or steps you attempted. Based on this reflection, devise a concise, revised plan of action that acknowledges your error and details the exact measures or methods you should have employed. For example, if you attempted steps A and B but overlooked step C, construct a plan that explicitly incorporates step C into your approach. This self-reflection and plan will be essential for when you reattempt the task. Present your plan immediately following the keyword “Plan:”.\n"
             prompt += "Plan:"
             
-
+            # print('+ + '*20)
+            # print(prompt)
             batch_prompts.append(prompt)
         
+        # max_token_reflexion = 256
+        # sampling_params_reflexion = SamplingParams(temperature=0.6, top_p=0.95, max_tokens=max_token_reflexion)
+            
+        # vllm_outputs = llm.generate(batch_prompts, sampling_params_reflexion)
+        model_name = "gpt-4.1-nano"
         with ThreadPoolExecutor(max_workers=12) as pool:
             api_outputs = list(pool.map(
                 lambda p: client.responses.create(model=model_name, input=p).output_text,
@@ -291,7 +330,6 @@ def evaluate_checkpoint(
             
             reflexion = generated_text
             
-            
             sample = samples[i]
             
             
@@ -299,7 +337,8 @@ def evaluate_checkpoint(
             
             last_weak_demo['plan'] = reflexion
         
-        with open("intermediate_round.pkl", "wb") as f:
+
+        with open("intermediate_round_creative_writing_self_refine_continued.pkl", "wb") as f:
             pickle.dump(samples, f)
             
         if round_idx % 1 == 0:
@@ -322,12 +361,11 @@ def evaluate_checkpoint(
             task = 'creative_writing_api'
 
             
-
             this_time_change = ""
             if rejection_sampling:
                 this_time_change += "best_of_n_"
             else:
-                this_time_change += "reflexion_"
+                this_time_change += "self_refine_done_right_70_continued"
             this_time_change += "100_gpt_4.1_same_base"
 
             this_time_change += f"_evalnum_{max_eval_samples}"

@@ -14,7 +14,6 @@ from datasets import load_dataset
 from vllm import LLM, SamplingParams
 
 from concurrent.futures import ThreadPoolExecutor
-
 from openai import OpenAI
 
 num_char = 200
@@ -24,11 +23,19 @@ api_eval = True
 
 
 rejection_sampling = 0
+ICRL = 1
 
 
-exploration_or_exploitation = 0
+
+
+
+
+
+
 num_weak_demos = 3000
 
+zero_shot = 0
+CoT = 1
 
 
 sort_by_reward = 0
@@ -36,6 +43,7 @@ sort_by_reward = 0
 
 
 client = OpenAI(api_key="Your_API_Key")
+
 
 
 sys.path.append('/tree-of-thought-llm/src')
@@ -54,7 +62,7 @@ def evaluate_checkpoint(
     checkpoint_path="creative_writing",
     base_model_id="GPT-4.1",
     max_eval_samples=45,
-    n=51,
+    n=1,
     max_new_tokens=1000
 ):
     num_samples = 100
@@ -65,7 +73,6 @@ def evaluate_checkpoint(
     tokenizer = AutoTokenizer.from_pretrained(base_model_id)
     
     sampling_params = SamplingParams(temperature=0.6, top_p=0.95, max_tokens=max_new_tokens)
-
     
     task = get_task("text")
     
@@ -75,9 +82,6 @@ def evaluate_checkpoint(
         
         cot_prompt_filled = cot_prompt.format(input=instruction)
 
-        # For a first generation we usually need the `Passage:` token that the
-        # scoring code looks for.  Appending it here nudges the model to continue
-        # with the actual passage.
         question = cot_prompt_filled
         samples.append({
             "question": question,
@@ -87,6 +91,7 @@ def evaluate_checkpoint(
     
     num_samples = len(samples)
     print(f"Processing {num_samples} samples in {n} rounds...")
+
     
     # Run n rounds.
     for round_idx in range(n):
@@ -94,18 +99,15 @@ def evaluate_checkpoint(
         # Build a prompt for each sample.
         batch_prompts = []
         for sample in samples:
-            
-            
             prompt = ""
-
-            for weak_demo in sample["weak_demos"][-num_weak_demos:]:
-                prompt += f"**Plan**: {weak_demo['plan']}\n"
-                
-            prompt += "Provide the response in `<answer>…</answer>` format."
-                
-            prompt += f"**Prompt**: {sample['question']}\n"
+            prompt += f"**Prompt**: {sample['question']}"
+            if CoT:
+                prompt += "Let's first think step by step, and place your chain of thoughts between <think> and </think> tags. Then put your answer containing the Plan and the Passage in `<answer>...</answer>` tags."
+            if zero_shot:
+                prompt += "Put your answer containing the Plan and the Passage in `<answer>...</answer>` tags. Make sure the Passage is as coherent as possible."
             batch_prompts.append(prompt)
         
+
         model_name = "gpt-4.1"
             
         with ThreadPoolExecutor(max_workers=12) as pool:
@@ -121,6 +123,7 @@ def evaluate_checkpoint(
             for i, output_obj in enumerate(api_outputs):
                 # Retrieve generated text.
                 generated_text = output_obj
+
                     
                 pattern = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
                 try:
@@ -139,7 +142,6 @@ def evaluate_checkpoint(
                     model_answer = model_answer.split("Passage:")[1]
                 except:
                     model_answer = model_answer
-
                 
                 
                 base_answer = samples[i]['weak_demos'][0]['answer']
@@ -153,6 +155,7 @@ def evaluate_checkpoint(
                 base_answer = """At dawn, golden light slips past pale curtains, rousing the world in quiet celebration. A lone robin greets the morning with a clear, cheerful trill, its song drifting across dew-laden grass. A gentle breeze stirs the leaves, carrying the fresh, earthy scent of new growth. Nearby, rooftops and empty streets lie poised between night’s calm and the city’s stirring pulse, promising simple comforts like a warm cup of coffee. In this tranquil pause, one senses life’s renewal and the gentle invitation to greet the day with hope and gratitude."""
                 
                 eval_prompt = f"Instruction: You are a seasoned text coherence evaluator. Read the TEXT below and rate the TEXT’s overall coherency on a 1-to-10 scale, where 1 means less coherent than the Base Answer, 5 means as coherent as the Base Answer, and 10 means way more coherent than the Base Answer. Be a strict and conservative evaluator and only gave a high score when the TEXT is truly better than the Base Answer. Base Answer: <<<{base_answer}>>> TEXT:<<<{model_answer}>>> Return your answer in exactly this format: Coherency score: <integer 1-10>. \nResponse:"
+                
 
                 eval_prompt_list.append(eval_prompt)
 
@@ -183,6 +186,10 @@ def evaluate_checkpoint(
             m = _RATING_RE.search(text)
             return int(m.group(1)) if m else None
 
+
+
+
+
         # Process batch responses.
         for i, output_obj in enumerate(api_outputs):
             # Retrieve generated text.
@@ -198,6 +205,7 @@ def evaluate_checkpoint(
             if rejection_sampling:
                 model_answer = generated_text
                 
+            
 
             if round_idx != 0:
 
@@ -233,6 +241,10 @@ def evaluate_checkpoint(
                 reward_value = 1.00
 
 
+
+
+            
+
             if round_idx == 0:
                 eval_result = ""
                 eval_prompt_i = ""
@@ -260,6 +272,9 @@ def evaluate_checkpoint(
         ## Generating Reflexion    
         batch_prompts = []
         for sample in samples:
+            # prompt = one_shot_prompt
+            # Add previous weak demonstrations if any.
+            # for weak_demo in sample["weak_demos"]:
             last_weak_demo = sample["weak_demos"][-1]
             prompt = ""
             prompt += "<attempt>\n"
@@ -276,9 +291,12 @@ def evaluate_checkpoint(
             prompt += "Instruction: You will be given the history of a past experience in which you encountered a task that required you to provide a response to a prompt aiming to maximize a reward, and you attempted a response. You were unsuccessful in providing an answer that achieved the specified desirable numerical reward of 10.0. Instead of recounting the details of the task itself, focus on analyzing the approach you took and the specific actions or steps you attempted. Based on this reflection, devise a concise, revised plan of action that acknowledges your error and details the exact measures or methods you should have employed. For example, if you attempted steps A and B but overlooked step C, construct a plan that explicitly incorporates step C into your approach. This self-reflection and plan will be essential for when you reattempt the task. Present your plan immediately following the keyword “Plan:”.\n"
             prompt += "Plan:"
             
-
             batch_prompts.append(prompt)
         
+
+            
+        # vllm_outputs = llm.generate(batch_prompts, sampling_params_reflexion)
+        model_name = "gpt-4.1-nano"
         with ThreadPoolExecutor(max_workers=12) as pool:
             api_outputs = list(pool.map(
                 lambda p: client.responses.create(model=model_name, input=p).output_text,
@@ -299,7 +317,9 @@ def evaluate_checkpoint(
             
             last_weak_demo['plan'] = reflexion
         
-        with open("intermediate_round.pkl", "wb") as f:
+        # Optionally, save intermediate results after each round.
+        # For example, you could pickle the samples list:
+        with open("intermediate_round_zero_shot.pkl", "wb") as f:
             pickle.dump(samples, f)
             
         if round_idx % 1 == 0:
@@ -321,13 +341,11 @@ def evaluate_checkpoint(
             # Save the results to files.
             task = 'creative_writing_api'
 
-            
-
             this_time_change = ""
             if rejection_sampling:
                 this_time_change += "best_of_n_"
             else:
-                this_time_change += "reflexion_"
+                this_time_change += "zero_shot"
             this_time_change += "100_gpt_4.1_same_base"
 
             this_time_change += f"_evalnum_{max_eval_samples}"
@@ -360,4 +378,3 @@ def evaluate_checkpoint(
 if __name__ == "__main__":
     print("Evaluating checkpoint in batch mode...")
     evaluate_checkpoint()
-    # main()
