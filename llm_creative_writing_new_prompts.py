@@ -8,7 +8,6 @@ import sys
 import numpy as np
 import torch
 import argparse
-import random
 
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
@@ -33,9 +32,12 @@ no_ICRL = 0
 
 no_reward = 0
 zero_reward = 0
-random_reward = 1  # New ablation: use random rewards from 1-10
 
 exploration_or_exploitation = 0
+
+meta_instruction_change = 1
+
+
 num_weak_demo = 3000
 
 load_samples = 0  # Don't load previous samples for testing
@@ -50,13 +52,14 @@ if not api_eval:
 else:
     client = OpenAI(api_key="Your_API_Key")
 
+if meta_instruction_change: 
+    exploitation_instruction = "Meta Prompt: surpass the highest score observed so far. Review the trials, then output your candidate inside `<response>…</response>`."
+    exploration_instruction = "Meta Prompt: Review every <trial> (response + score). Reply with a new, non‑repeating answer wrapped in `<response>…</response>` tags"
+else: 
+    exploration_instruction = "Instruction: Examine all the `<trial>…</trial>` examples, each showing a candidate Response and its Score. Provide a response that is different from previous trials demonstrated in the context, and wrap it in `<response>…</response>`."
+    exploitation_instruction = "Instruction: You will be given multiple <trial>…</trial> entries. Each entry contains a candidate Response and its Score. Your task: Based on the previous trials, try your best to produce a response that can achieve a higher score, while making sure it correctly follows the task instruction, and put it in `<response>…</response>` format."
 
-
-exploration_instruction = "Instruction: Examine all the `<attempt>…</attempt>` examples, each showing a candidate Response and its Reward. Provide a response that is different from previous attempts demonstrated in the context, and wrap it in `<answer>…</answer>`."
-
-exploitation_instruction = "Instruction: You will be given multiple <attempt>…</attempt> entries. Each entry contains a candidate Response and its Reward. Your task: Based on the previous attempts, try your best to produce a response that can achieve a higher reward, while making sure it correctly follows the task instruction, and put it in `<answer>…</answer>` format."
-
-explore_or_exploit_instruction = "Instruction: Examine all the `<attempt>…</attempt>` examples, each showing a candidate Response and its Reward. You have two options, exploration or exploitation. For exploration, provide a response that is different from previous attempts demonstrated in the context, and wrap it in `<answer>…</answer>`. For exploitation, make the best educated guess based on the high reward attempts to produce response that can achieve a higher reward, while making sure it correctly follows the task instruction, and put it in `<answer>…</answer>` format. Pick one option to follow."
+explore_or_exploit_instruction = "Instruction: Examine all the `<trial>…</trial>` examples, each showing a candidate Response and its Score. You have two options, exploration or exploitation. For exploration, provide a response that is different from previous trials demonstrated in the context, and wrap it in `<response>…</response>`. For exploitation, make the best educated guess based on the high score trials to produce response that can achieve a higher score, while making sure it correctly follows the task instruction, and put it in `<response>…</response>` format. Pick one option to follow."
 
 
 # Load prompts directly to avoid import issues
@@ -153,20 +156,20 @@ def evaluate_checkpoint(
                 else:
                     weak_demos = sample["weak_demos"]
                 for weak_demo in weak_demos[-num_weak_demo:]:
-                    prompt += "<attempt>\n"
-                    prompt += f"**Prompt**: {weak_demo['prompt']}\n"
+                    prompt += "<trial>\n"
+                    prompt += f"**Task Query**: {weak_demo['prompt']}\n"
                     if not no_reward: 
                         if zero_reward:
-                            prompt += f"**Reward**: {0.00}\n"
+                            prompt += f"**Score**: {0.00}\n"
                         else:
-                            prompt += f"**Reward**: {weak_demo['reward']}\n"
+                            prompt += f"**Score**: {weak_demo['reward']}\n"
                     prompt += weak_demo['answer'][:-28] + "\n"
                     if not no_reward: 
                         if zero_reward:
-                            prompt += f"**Reward**: {0.00}\n"
+                            prompt += f"**Score**: {0.00}\n"
                         else:
-                            prompt += f"**Reward**: {weak_demo['reward']}\n"
-                    prompt += "</attempt>"
+                            prompt += f"**Score**: {weak_demo['reward']}\n"
+                    prompt += "</trial>"
                 if ICRL: 
                     if round_idx % 2 == 0:
                         prompt += exploration_instruction
@@ -181,9 +184,9 @@ def evaluate_checkpoint(
                 if exploration_or_exploitation:
                     prompt += explore_or_exploit_instruction
                 if no_ICRL:
-                    prompt += "Instruction: put your response to the following prompt in `<answer>…</answer>` format."
+                    prompt += "Instruction: put your response to the following prompt in `<response>…</response>` format."
 
-            prompt += f"**Prompt**: {sample['question']}\n"
+            prompt += f"**Task Query**: {sample['question']}\n"
 
             batch_prompts.append(prompt)
         
@@ -202,13 +205,13 @@ def evaluate_checkpoint(
         
         eval_prompt_list = []
         
-        if round_idx != 0 and not random_reward:
+        if round_idx != 0:
         
             for i, output_obj in enumerate(api_outputs):
                 # Retrieve generated text.
                 generated_text = output_obj
                     
-                pattern = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
+                pattern = re.compile(r'<response>(.*?)</response>', re.DOTALL)
                 try:
                     model_answer = pattern.findall(generated_text)[0]
                 except:
@@ -272,8 +275,8 @@ def evaluate_checkpoint(
         for i, output_obj in enumerate(api_outputs):
             # Retrieve generated text.
             generated_text = output_obj
-            # Use regex to extract text up to </attempt>
-            pattern = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
+            # Use regex to extract text between <response> tags
+            pattern = re.compile(r'<response>(.*?)</response>', re.DOTALL)
             try:
                 model_answer = pattern.findall(generated_text)[0]
             except:
@@ -285,36 +288,27 @@ def evaluate_checkpoint(
             
 
             if round_idx != 0:
-                if random_reward:
-                    # Generate random reward between 1 and 10
-                    reward_value = random.randint(1, 10)
-                    reward_str = str(reward_value)
-                    eval_result = f"Random reward: {reward_value}"
-                    print("[]"*20, "\n Random reward generated")
-                    print("--"*10)
-                    print("reward_str", reward_str)
-                    print('reward_value', reward_value)
-                else:
-                    eval_result = eval_result_list[i]
 
-                    # _RATING_RE = re.compile(r"Humor rating:\s*(10|[1-9])\b")
-                    RATING_RE = re.compile(r"Coherency score:\s*(10|[1-9])\b")
-                    # RATING_RE = re.compile(r"Originality score:\s*(10|[1-9])\b")
+                eval_result = eval_result_list[i]
+
+                # _RATING_RE = re.compile(r"Humor rating:\s*(10|[1-9])\b")
+                RATING_RE = re.compile(r"Coherency score:\s*(10|[1-9])\b")
+                # RATING_RE = re.compile(r"Originality score:\s*(10|[1-9])\b")
 
 
-                    def get_humor_rating(text):
-                        """Return the humor rating or None if the pattern isn't present."""
-                        m = _RATING_RE.search(text)
-                        return int(m.group(1)) if m else None
-                    reward_str = get_humor_rating(eval_result)
-                    try:
-                        reward_value = int(reward_str)
-                    except:
-                        reward_value = 0
-                    print("[]"*20, "\n eval_result", eval_result)
-                    print("--"*10)
-                    print("reward_str", reward_str)
-                    print('reward_value', reward_value)
+                def get_humor_rating(text):
+                    """Return the humor rating or None if the pattern isn't present."""
+                    m = _RATING_RE.search(text)
+                    return int(m.group(1)) if m else None
+                reward_str = get_humor_rating(eval_result)
+                try:
+                    reward_value = int(reward_str)
+                except:
+                    reward_value = 0
+                print("[]"*20, "\n eval_result", eval_result)
+                print("--"*10)
+                print("reward_str", reward_str)
+                print('reward_value', reward_value)
             else:
 
                 reward_str = str(1.00)
@@ -326,10 +320,7 @@ def evaluate_checkpoint(
                 eval_result = ""
                 eval_prompt_i = ""
             else:
-                if random_reward:
-                    eval_prompt_i = ""
-                else:
-                    eval_prompt_i = eval_prompt_list[i]
+                eval_prompt_i = eval_prompt_list[i]
             # Create a weak demo dictionary.
             weak_demo = {
                 "prompt": samples[i]["question"],
@@ -378,11 +369,9 @@ def evaluate_checkpoint(
             this_time_change = ""
             if rejection_sampling:
                 this_time_change += "best_of_n_"
-            elif random_reward:
-                this_time_change += "random_reward_"
             else:
                 this_time_change += "ICRL_"
-            this_time_change += "new_eval_prompt"
+            this_time_change += "different_prompts"
 
             this_time_change += f"_evalnum_{max_eval_samples}"
             run = f"{this_time_change}_n_{n}"
