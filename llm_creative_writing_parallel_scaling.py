@@ -42,6 +42,9 @@ load_samples = 0  # Don't load previous samples for testing
 
 sort_by_reward = 0
 
+# Best-of-n parallel scaling parameter
+best_of_n = 5  # Number of parallel responses to generate per sample
+
 # Initialize vLLM model when not using API
 if not api_eval:
     llm = LLM(model="Qwen/Qwen3-32B", 
@@ -97,8 +100,12 @@ def evaluate_checkpoint(
     split="test",
     max_eval_samples=45,
     n=51,
-    max_new_tokens=1000
+    max_new_tokens=1000,
+    best_of_n_param=5
 ):
+    # Use the parameter or global best_of_n
+    n_parallel = best_of_n_param if best_of_n_param is not None else best_of_n
+    
     num_samples = 100  # Test with 5 samples
     
     max_eval_samples = num_samples
@@ -129,7 +136,7 @@ def evaluate_checkpoint(
         })
     
     num_samples = len(samples)
-    print(f"Processing {num_samples} samples in {n} rounds...")
+    print(f"Processing {num_samples} samples in {n} rounds with best-of-{n_parallel} parallel scaling...")
     
     if load_samples:
         with open("intermediate_round_creative_writing_simple_prompt.pkl", "rb") as f:
@@ -141,7 +148,10 @@ def evaluate_checkpoint(
         print(f"Round {round_idx+1}/{n}...")
         # Build a prompt for each sample.
         batch_prompts = []
-        for sample in samples:
+        expanded_batch_prompts = []  # Will contain n_parallel copies of each prompt
+        prompt_to_sample_idx = []    # Maps each expanded prompt to its sample index
+        
+        for sample_idx, sample in enumerate(samples):
             
             
             prompt = ""
@@ -186,6 +196,11 @@ def evaluate_checkpoint(
             prompt += f"**Prompt**: {sample['question']}\n"
 
             batch_prompts.append(prompt)
+            
+            # Create n_parallel copies of this prompt
+            for _ in range(n_parallel):
+                expanded_batch_prompts.append(prompt)
+                prompt_to_sample_idx.append(sample_idx)
         
         if api_eval:
             # Use OpenAI API for generation
@@ -193,14 +208,15 @@ def evaluate_checkpoint(
             with ThreadPoolExecutor(max_workers=12) as pool:
                 api_outputs = list(pool.map(
                     lambda p: client.responses.create(model=model_name, input=p).output_text,
-                    batch_prompts
+                    expanded_batch_prompts
                 ))
         else:
-            # Use vLLM for generation
-            vllm_outputs = llm.generate(batch_prompts, sampling_params)
+            # Use vLLM for generation - now with n_parallel copies per sample
+            vllm_outputs = llm.generate(expanded_batch_prompts, sampling_params)
             api_outputs = [output.outputs[0].text for output in vllm_outputs]
         
         eval_prompt_list = []
+        all_responses = []  # Store all responses with their sample indices
         
         if round_idx != 0 and not random_reward:
         
@@ -226,8 +242,9 @@ def evaluate_checkpoint(
                 except:
                     model_answer = model_answer
                 
-                
-                base_answer = samples[i]['weak_demos'][0]['answer']
+                # Get the correct sample index for this response
+                sample_idx = prompt_to_sample_idx[i]
+                base_answer = samples[sample_idx]['weak_demos'][0]['answer'] if samples[sample_idx]['weak_demos'] else ""
                 
                 
                 try:
@@ -268,7 +285,9 @@ def evaluate_checkpoint(
             m = _RATING_RE.search(text)
             return int(m.group(1)) if m else None
 
-        # Process batch responses.
+        # Process batch responses and collect all responses with their evaluations
+        all_responses_by_sample = [[] for _ in range(num_samples)]
+        
         for i, output_obj in enumerate(api_outputs):
             # Retrieve generated text.
             generated_text = output_obj
@@ -283,6 +302,8 @@ def evaluate_checkpoint(
             if rejection_sampling:
                 model_answer = generated_text
             
+            # Get the correct sample index for this response
+            sample_idx = prompt_to_sample_idx[i]
 
             if round_idx != 0:
                 if random_reward:
@@ -290,10 +311,6 @@ def evaluate_checkpoint(
                     reward_value = random.randint(1, 10)
                     reward_str = str(reward_value)
                     eval_result = f"Random reward: {reward_value}"
-                    print("[]"*20, "\n Random reward generated")
-                    print("--"*10)
-                    print("reward_str", reward_str)
-                    print('reward_value', reward_value)
                 else:
                     eval_result = eval_result_list[i]
 
@@ -311,43 +328,65 @@ def evaluate_checkpoint(
                         reward_value = int(reward_str)
                     except:
                         reward_value = 0
-                    print("[]"*20, "\n eval_result", eval_result)
-                    print("--"*10)
-                    print("reward_str", reward_str)
-                    print('reward_value', reward_value)
             else:
-
                 reward_str = str(1.00)
                 reward_value = 1.00
-
-
+                eval_result = ""
 
             if round_idx == 0:
-                eval_result = ""
                 eval_prompt_i = ""
             else:
                 if random_reward:
                     eval_prompt_i = ""
                 else:
                     eval_prompt_i = eval_prompt_list[i]
-            # Create a weak demo dictionary.
-            weak_demo = {
-                "prompt": samples[i]["question"],
-                "answer": model_answer,
-                "reward": reward_str
-            }
-            # Append to the sample's weak demo history.
-            samples[i]["weak_demos"].append(weak_demo)
-            # Record the round output.
-            samples[i]["output"].append({
-                "round": round_idx,
-                "prompt": batch_prompts[i],
-                "answer": model_answer,
+                    
+            # Store all response data for this sample
+            response_data = {
                 "generated_text": generated_text,
-                "reward": reward_value,
-                "eval_generated_text": eval_result,
+                "model_answer": model_answer,
+                "reward_str": reward_str,
+                "reward_value": reward_value,
+                "eval_result": eval_result,
                 "eval_prompt": eval_prompt_i
-            })
+            }
+            all_responses_by_sample[sample_idx].append(response_data)
+        
+        # Now select the best response for each sample
+        for sample_idx in range(num_samples):
+            responses = all_responses_by_sample[sample_idx]
+            
+            # Find the best response (highest reward)
+            best_response = max(responses, key=lambda x: x["reward_value"])
+            
+            # Log selection info
+            rewards = [r["reward_value"] for r in responses]
+            print(f"Sample {sample_idx}: Selected best of {n_parallel} responses. Rewards: {rewards}, Best: {best_response['reward_value']}")
+            
+            # Create a weak demo dictionary for the best response
+            weak_demo = {
+                "prompt": samples[sample_idx]["question"],
+                "answer": best_response["model_answer"],
+                "reward": best_response["reward_str"]
+            }
+            # Append only the best response to the sample's weak demo history
+            samples[sample_idx]["weak_demos"].append(weak_demo)
+            
+            # Record all responses in output for analysis (optional)
+            # But mark which one was selected as best
+            for idx, response in enumerate(responses):
+                is_best = (response == best_response)
+                samples[sample_idx]["output"].append({
+                    "round": round_idx,
+                    "prompt": batch_prompts[sample_idx],
+                    "answer": response["model_answer"],
+                    "generated_text": response["generated_text"],
+                    "reward": response["reward_value"],
+                    "eval_generated_text": response["eval_result"],
+                    "eval_prompt": response["eval_prompt"],
+                    "is_best": is_best,  # Mark if this was the selected response
+                    "parallel_idx": idx  # Which parallel sample this was
+                })
         
         # Optionally, save intermediate results after each round.
         # For example, you could pickle the samples list:
@@ -382,9 +421,11 @@ def evaluate_checkpoint(
                 this_time_change += "random_reward_"
             else:
                 this_time_change += "ICRL_"
-            this_time_change += "new_eval_prompt"
+            this_time_change += "parallel_scaling"
 
             this_time_change += f"_evalnum_{max_eval_samples}"
+            # Add best_of_n to the path name
+            this_time_change += f"_parallel_{n_parallel}"
             run = f"{this_time_change}_n_{n}"
             path = f"/sfs/weka/scratch/ks8vf/code_submission/ICL/{task}/{base_model_id}/{run}"
             
@@ -412,6 +453,6 @@ def evaluate_checkpoint(
                 f.write(f"Last Reward Average: {np.mean(last_reward_list):.2%}")
 
 if __name__ == "__main__":
-    print("Evaluating checkpoint in batch mode...")
+    print("Evaluating checkpoint in batch mode with parallel scaling...")
     # Test with fewer rounds to verify implementation
-    evaluate_checkpoint(n=100)  # 100 rounds for full experiment
+    evaluate_checkpoint(n=100, best_of_n_param=5)  # 100 rounds with best-of-5 sampling
